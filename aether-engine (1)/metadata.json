@@ -1,0 +1,6 @@
+{
+  "name": "Aether Engine",
+  "description": "Premium real-time particle physics simulation guided by interactive hand tracking.",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
