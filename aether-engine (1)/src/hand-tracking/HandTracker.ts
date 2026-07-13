@@ -13,6 +13,7 @@ export interface TrackerCallbacks {
 
 export class HandTracker {
   private handLandmarker: HandLandmarker | null = null;
+  private activeToken: symbol | null = null;
   private videoElement: HTMLVideoElement | null = null;
   private mediaStream: MediaStream | null = null;
   private isTrackerActive: boolean = false;
@@ -47,34 +48,35 @@ export class HandTracker {
   public async initialize(callbacks?: TrackerCallbacks): Promise<void> {
     if (this.isLoading || this.isLoaded) return;
     this.isLoading = true;
-    
+
+    const token = Symbol("hand-tracker-init");
+    this.activeToken = token;
+
     if (callbacks) {
       this.callbacks = callbacks;
     }
 
     try {
-      // 0. Ensure video element is created
       this.ensureVideoElement();
 
-      // 1. Request Camera Access and play video FIRST (as requested: ensure MediaPipe initializes only after video is playing)
       console.log("[HandTracker] Step 1/4: Requesting local user webcam permissions...");
-      await this.startCamera();
+      await this.startCamera(token);
+      if (this.activeToken !== token) return this.abortInit();
 
-      // 2. Wait for LoadedMetadata
       console.log("[HandTracker] Step 2/4: Waiting for video stream metadata to load...");
       await this.waitForVideoMetadata();
+      if (this.activeToken !== token) return this.abortInit();
 
-      // 3. Play video and wait for playing state
       console.log("[HandTracker] Step 3/4: Activating webcam stream playback...");
       await this.playVideo();
+      if (this.activeToken !== token) return this.abortInit();
 
-      // 4. Initialize MediaPipe (only after the video is playing!)
       console.log("[HandTracker] Step 4/4: Video is active. Loading MediaPipe fileset resolver and models...");
-      
+
       const vision = await FilesetResolver.forVisionTasks(
         "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.8/wasm"
       );
-      console.log("[HandTracker] Step 4/4: FilesetResolver loaded successfully. Creating HandLandmarker...");
+      if (this.activeToken !== token) return this.abortInit();
 
       this.handLandmarker = await HandLandmarker.createFromOptions(vision, {
         baseOptions: {
@@ -82,11 +84,17 @@ export class HandTracker {
           delegate: "GPU",
         },
         runningMode: "VIDEO",
-        numHands: 1, // Only single hand needed for Aether V1 (Section 7)
+        numHands: 1,
         minHandDetectionConfidence: 0.5,
         minHandPresenceConfidence: 0.5,
         minTrackingConfidence: 0.5,
       });
+
+      if (this.activeToken !== token) {
+        this.handLandmarker?.close();
+        this.handLandmarker = null;
+        return this.abortInit();
+      }
 
       console.log("[HandTracker] Step 4/4: HandLandmarker initialized successfully. Ready to detect!");
 
@@ -97,28 +105,31 @@ export class HandTracker {
       if (this.callbacks?.onLoaded) {
         this.callbacks.onLoaded();
       }
-
     } catch (err: any) {
       this.isLoading = false;
+      if (this.activeToken !== token) return; // superseded by destroy(); swallow
       const errMsg = err.message || "Failed to load hand tracking system assets.";
       console.error("[HandTracker Error during initialize]:", err);
       if (this.callbacks?.onError) {
         this.callbacks.onError(errMsg);
       }
-      throw err; // Propagate so Engine can catch and show on-screen
+      throw err;
     }
   }
 
-  private async startCamera(): Promise<void> {
+  private abortInit() {
+    console.log("[HandTracker] Initialization aborted (destroy() called mid-flight).");
+    this.isLoading = false;
+  }
+  private async startCamera(token: symbol): Promise<void> {
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
       throw new Error("Camera API (getUserMedia) not supported in this browser. Please use Chrome/Firefox/Safari.");
     }
 
     try {
       this.ensureVideoElement();
-      
-      // Standard video resolution suitable for fast real-time inference on CPU/WASM
-      this.mediaStream = await navigator.mediaDevices.getUserMedia({
+
+      const stream = await navigator.mediaDevices.getUserMedia({
         video: {
           width: { ideal: 640 },
           height: { ideal: 480 },
@@ -127,7 +138,18 @@ export class HandTracker {
         audio: false,
       });
 
+      // If destroy() ran while we were awaiting the camera, don't attach
+      // a stream to a torn-down tracker — release it and bail out cleanly.
+      if (this.activeToken !== token) {
+        stream.getTracks().forEach((track) => track.stop());
+        return;
+      }
+
+      this.mediaStream = stream;
       console.log("[HandTracker] Camera MediaStream obtained successfully:", this.mediaStream.id);
+
+      // Re-ensure the element in case something removed it during the await.
+      this.ensureVideoElement();
 
       if (this.videoElement) {
         this.videoElement.srcObject = this.mediaStream;
@@ -139,7 +161,7 @@ export class HandTracker {
       console.error("[HandTracker] getUserMedia error:", err);
       const errName = err.name || "";
       const isPermissionDenied = errName === "NotAllowedError" || errName === "PermissionDeniedError" || String(err).includes("denied");
-      
+
       let errMsg = "Camera permission denied or camera device not found. Please enable camera access in your browser bar.";
       if (isPermissionDenied) {
         errMsg = "Camera permission denied. If you are viewing inside an iframe/preview mode, please click 'Open in New Tab' to bypass security sandbox constraints.";
@@ -259,9 +281,11 @@ export class HandTracker {
    */
   public destroy() {
     console.log("[HandTracker] Destroying hand tracker and releasing camera...");
+    // Invalidate any in-flight initialize() so it aborts on its next
+    // await-boundary check instead of operating on torn-down state.
+    this.activeToken = null;
     this.isTrackerActive = false;
-    
-    // Stop video and camera track streams
+
     if (this.mediaStream) {
       this.mediaStream.getTracks().forEach((track) => {
         console.log("[HandTracker] Stopping track:", track.label);
@@ -286,8 +310,9 @@ export class HandTracker {
     }
 
     this.isLoaded = false;
+    this.isLoading = false;
     this.callbacks = null;
-  }
+}
 
   public isReady(): boolean {
     return this.isLoaded && this.isTrackerActive;
