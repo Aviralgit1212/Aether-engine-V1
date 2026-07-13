@@ -22,31 +22,32 @@ export const AetherEngine: React.FC<AetherEngineProps> = ({
 }) => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const engineRef = useRef<EngineLoop | null>(null);
-  
+  // Guards against the isActive-driven useEffect tearing down an engine
+// that was just created/stopped by the same startEngine/stopEngine call.
+const isSelfTransitionRef = useRef(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [loadingState, setLoadingState] = useState<"idle" | "loading" | "running" | "error">("idle");
 
   const startEngine = async () => {
     if (!canvasRef.current) return;
-    
+
     setLoadingState("loading");
     setErrorMsg(null);
+    isSelfTransitionRef.current = true;
     onActiveChange(true);
 
     try {
-      // 1. Create engine loop instance
       const engine = new EngineLoop(canvasRef.current);
       engineRef.current = engine;
 
-      // 2. Register stats update
       engine.registerOnStatsUpdate((stats) => {
         onStatsUpdate(stats);
       });
 
-      // 3. Launch engine (loads MediaPipe and requests camera access)
       await engine.start((err) => {
         setErrorMsg(err);
         setLoadingState("error");
+        isSelfTransitionRef.current = true;
         onActiveChange(false);
       });
 
@@ -54,11 +55,12 @@ export const AetherEngine: React.FC<AetherEngineProps> = ({
     } catch (err: any) {
       setErrorMsg(err.message || "Failed to initialize Aether Engine.");
       setLoadingState("error");
+      isSelfTransitionRef.current = true;
       onActiveChange(false);
     }
   };
-
   const stopEngine = () => {
+    isSelfTransitionRef.current = true;
     if (engineRef.current) {
       engineRef.current.stop();
       engineRef.current = null;
@@ -83,8 +85,16 @@ export const AetherEngine: React.FC<AetherEngineProps> = ({
     } else if (!isActive && loadingState === "running") {
       stopEngine();
     }
-    
+
     return () => {
+      // If this dependency change was caused by our own startEngine/stopEngine
+      // call, that call already owns the engine lifecycle for this transition —
+      // do not stop the engine again here (this was the source of the race
+      // that destroyed the video element mid-initialize()).
+      if (isSelfTransitionRef.current) {
+        isSelfTransitionRef.current = false;
+        return;
+      }
       if (engineRef.current) {
         engineRef.current.stop();
         engineRef.current = null;
